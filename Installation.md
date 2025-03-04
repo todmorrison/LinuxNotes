@@ -1,94 +1,125 @@
 # System76 Laptop Arch Linux Install Notes
 
-## Disk Preparation
+## Motivation
+
+The goal is to have thoroughly encrypted system with btrfs snapshots and backups. Primarily, I use
+Arch Linux. However, since System 76 develops PopOS and it is useful to have a "known good"
+configuration when diagnosing suspected hardware issues and the like, I add a smaller PopOS
+installation to the mix.
+
+## I. Disk Preparation
 
 1. Partition main storage device using fdisk utility. You can find storage device name using lsblk command.
-```
-    $ fdisk /dev/nvme0n1
-                    [repeat this command until all existing partitions are deleted]
-    Command (m for help): d
-    Command (m for help): d
 
-                    [create partition 1: efi]
+    ```
+    # lsblk
+    NAME                    MAJ:MIN RM  SIZE RO TYPE  MOUNTPOINTS
+    ...
+    nvme0n1                 259:0    0  1.8T  0 disk
+    ├─nvme0n1p1             259:1    0    2G  0 part
+    └─nvme0n1p2             259:2    0  1.8T  0 part
+    # fdisk /dev/nvme0n1
+    ```
+    Delete existing partitions, repeat as needed until all existing partitions are removed.
+    ```
+    Command (m for help): d
+    Command (m for help): d
+    ```
+    Create EFI partition first:
+    ```
     Command (m for help): n
     Partition number (1-128, default 1): Enter ↵
     First sector (..., default 2048): Enter ↵
     Last sector ...: +2G
-
-                    [create partition 2: luks container]
+    ```
+    Then create the LUKS container (partition):
+    ```
     Command (m for help): n
     Partition number (2-128, default 2): Enter ↵
     First sector (..., default ...): Enter ↵
     Last sector ...: Enter ↵
-
-                    [change partition types]
+    ```
+    and change the partition types:
+    ```
     Command (m for help): t
     Partition number (1-3, default 1): 1
     Partion type or alias (type L to list all): uefi
     Command (m for help): t
     Partition number (1-3, default 2): 2
     Partion type or alias (type L to list all): linux
+    ```
 
-                    [write partitioning to disk]
+    Finally, write the partitioning to disk:
+    ```
     Command (m for help): w
-```
+    ```
+
 2. Create the encrypted LUKS2 container
 
-```$ cryptsetup luksFormat /dev/nvme0n1p2```
+    ```
+    # cryptsetup luksFormat /dev/nvme0n1p2
+    ```
 
-3. Create 
-```
-$ sudo cryptsetup luksOpen /dev/nvme0n1p2 cryptdata
-# Enter passphrase for /dev/nvme0n1p2:
-$ sudo pvs
-#  PV                    VG   Fmt  Attr PSize  PFree
-#  /dev/mapper/cryptdata data lvm2 a--  47.39g    0
-sudo vgs
-#  VG   #PV #LV #SN Attr   VSize  VFree
-#  data   1   1   0 wz--n- 47.39g    0
-sudo lvs
-#  LV   VG   Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
-#  root data -wi-a----- 47.39g
-sudo lsblk /dev/mapper/data-root -f
-#NAME      FSTYPE FSVER LABEL UUID                                 FSAVAIL FSUSE% MOUNTPOINTS
-#data-root ext4   1.0         bcb96b85-03df-45ca-92aa-6a182386631b 
-```
+3. Open the LUKS2 container and create a physical volume on top of it:
 
-Create a physical volume on top of the opened LUKS container:
+    ```
+    # sudo cryptsetup luksOpen /dev/nvme0n1p2 cryptdata
+    Enter passphrase for /dev/nvme0n1p2:
+    # pvcreate /dev/mapper/cryptdata
+    ```
 
-```$ pvcreate /dev/mapper/cryptdata```
+4. Create a volume group (in this example, it is named SSDVolGroup) and add the previously created physical volume to it:
 
-Create a volume group (in this example, it is named SSDVolGroup) and add the previously created physical volume to it:
+    ```
+    # vgcreate SSDVolGroup /dev/mapper/cryptdata
+    ```
 
-```$ vgcreate SSDVolGroup /dev/mapper/cryptdata```
+5. Create all your logical volumes on the volume group (384G for Arch Linux, 128G for PopOS, 72G
+   swap at the end, and the rest for /home):
 
-Create all your logical volumes on the volume group:
+    ```
+     # lvcreate -L 384G SSDVolGroup -n Arch
+     # lvcreate -L 128G SSDVolGroup -n PopOS
+     # lvcreate -l 100%FREE SSDVolGroup -n home
+     # lvreduce -L -72G SSDVolGroup/home
+     # lvcreate -l 100%FREE SSDVolGroup -n swap
+    ```
 
-```
-$ lvcreate -L 384G SSDVolGroup -n Arch
-$ lvcreate -L 128G SSDVolGroup -n PopOS
-$ lvcreate -l 100%FREE SSDVolGroup -n home
-$ lvreduce -L -72G SSDVolGroup/home
-$ lvcreate -l 100%FREE SSDVolGroup -n swap
-```
+6. Format your file systems on each logical volume and the EFI partition:
 
-Format your file systems on each logical volume:
+    ```
+     # mkfs.fat -F 32 -n ESP /dev/nvme0n1p1 
+     # mkfs.btrfs -L Arch /dev/SSDVolGroup/Arch
+     # mkfs.btrfs -L Home /dev/SSDVolGroup/home
+     # mkswap /dev/SSDVolGroup/swap
+    ```
+    (Note: do not format the volume for PopOS as the PopOS installer expects an empty
+    partition/volume.)
 
-```
-$ mkfs.btrfs /dev/SSDVolGroup/Arch
-$ mkfs.btrfs /dev/SSDVolGroup/home
-$ mkswap /dev/SSDVolGroup/swap
-```
+6. Mount the Arch volume to create **subvolumes**:
 
-Create **subvolumes**:
-```
-...
-```
+    ```
+    # btrfs subvolume create /mnt/@
+    # btrfs subvolume create /mnt/@snapshots
+    # btrfs subvolume create /mnt/@cache
+    # btrfs subvolume create /mnt/@libvirt
+    # btrfs subvolume create /mnt/@log
+    # btrfs subvolume create /mnt/@tmp
+    ```
+    (Note: the Btrfs file system must be mounted to create the subvolumes, but we will remount it the
+    way we want in the next step.)
 
-Mount your file systems:
+8. Unmount the Arch volume and then mount the subvolumes (as well as the "home" and swap file
+   systems) as appropriate:
 
-```
-$ mount -o subvol=/@ /dev/SSDVolGroup/Arch /mnt
-$ mount --mkdir -o /dev/SSDVolGroup/home /mnt/home
-$ swapon /dev/SSDVolGroup/swap
-```
+    ```
+     # umount /mnt
+     # mount -o subvol=/@ /dev/SSDVolGroup/Arch /mnt
+     # mount -o subvol=/@snapshots /dev/SSDVolGroup/Arch /mnt/.snapshots
+     # mount -o subvol=/@cache /dev/SSDVolGroup/Arch /mnt/var/cache
+     # mount -o subvol=/@libvirt /dev/SSDVolGroup/Arch /mnt/var/lib/libvirt
+     # mount -o subvol=/@log /dev/SSDVolGroup/Arch /mnt/var/log
+     # mount -o subvol=/@tmp /dev/SSDVolGroup/Arch /mnt/var/tmp
+     # mount --mkdir -o /dev/SSDVolGroup/home /mnt/home
+     # swapon /dev/SSDVolGroup/swap
+    ```
